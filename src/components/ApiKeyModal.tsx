@@ -27,7 +27,11 @@ export const ApiKeyModal: React.FC<ApiKeyModalProps> = ({
 
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
-    onSaveKey(keyInput.trim());
+    const cleanKey = keyInput
+      .trim()
+      .replace(/^["']|["']$/g, "")
+      .replace(/[\r\n\t\s]/g, "");
+    onSaveKey(cleanKey);
     setSavedSuccess(true);
     setTimeout(() => {
       setSavedSuccess(false);

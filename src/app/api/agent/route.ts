@@ -182,27 +182,18 @@ export async function POST(req: NextRequest) {
 
     const { messages, apiKey: clientApiKey, customInstruction } = body;
 
-    // 2. Validación de API Key
-    if (clientApiKey !== undefined && clientApiKey !== null && clientApiKey !== "") {
-      if (typeof clientApiKey !== "string") {
-        return NextResponse.json(
-          { error: "El formato de la API Key es inválido." },
-          { status: 400 }
-        );
-      }
-      const trimmedKey = clientApiKey.trim();
-      // Validar formato seguro: alfanumérico, guión, guión bajo, longitud típica de Google API Key (20 - 150 chars)
-      if (!/^[a-zA-Z0-9_\-]{20,150}$/.test(trimmedKey)) {
-        return NextResponse.json(
-          { error: "La API Key proporcionada no tiene una estructura válida de Google AI Studio." },
-          { status: 400 }
-        );
-      }
+    // 2. Limpieza y sanitización de API Key
+    let sanitizedClientKey = "";
+    if (typeof clientApiKey === "string") {
+      sanitizedClientKey = clientApiKey
+        .trim()
+        .replace(/^["']|["']$/g, "")
+        .replace(/[\r\n\t\s]/g, "");
     }
 
-    const apiKey = (clientApiKey ? clientApiKey.trim() : null) || process.env.GEMINI_API_KEY;
+    const apiKey = sanitizedClientKey || process.env.GEMINI_API_KEY;
 
-    if (!apiKey) {
+    if (!apiKey || apiKey.length < 10) {
       return NextResponse.json(
         {
           error:
