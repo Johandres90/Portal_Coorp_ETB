@@ -40,9 +40,11 @@ export default function HomePage() {
       if (storedTheme === "dark") {
         setIsDarkMode(true);
         document.documentElement.classList.add("dark");
+        document.body?.classList.add("dark");
       } else {
         setIsDarkMode(false);
         document.documentElement.classList.remove("dark");
+        document.body?.classList.remove("dark");
       }
 
       // API Key
@@ -75,10 +77,14 @@ export default function HomePage() {
       const next = !prev;
       if (next) {
         document.documentElement.classList.add("dark");
+        document.body?.classList.add("dark");
         localStorage.setItem("etb_theme", "dark");
+        triggerToast("Modo Oscuro Activado 🌙");
       } else {
         document.documentElement.classList.remove("dark");
+        document.body?.classList.remove("dark");
         localStorage.setItem("etb_theme", "light");
+        triggerToast("Modo Claro Activado ☀️");
       }
       return next;
     });
@@ -301,7 +307,7 @@ export default function HomePage() {
   );
 
   return (
-    <div className="flex flex-col min-h-screen bg-[#F8FAFC] dark:bg-slate-950 text-slate-900 dark:text-slate-100 transition-colors">
+    <div className={`flex flex-col min-h-screen ${isDarkMode ? "dark bg-slate-950 text-slate-100" : "bg-[#F8FAFC] text-slate-900"} transition-colors`}>
       {/* Header */}
       <Header
         hasApiKey={Boolean(apiKey) || true}
