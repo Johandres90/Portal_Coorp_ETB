@@ -85,6 +85,22 @@ ${rulesMarkdown}
 }
 
 /**
+ * Sanitiza valores para prevenir inyección de fórmulas CSV (CWE-1236 / Formula Injection).
+ * Si el contenido comienza con caracteres de comando (=, +, -, @, \t, \r, %),
+ * antepone una comilla simple (') para neutralizar la ejecución de fórmulas en Excel/Sheets.
+ */
+function sanitizeCsvValue(val: string | number | null | undefined): string {
+  if (val === null || val === undefined) return "";
+  const str = String(val);
+  const trimmed = str.trimStart();
+  // Neutralizar caracteres que inician fórmulas o comandos en hojas de cálculo
+  if (/^[=+\-@\t\r%]/.test(trimmed)) {
+    return `'${str}`;
+  }
+  return str;
+}
+
+/**
  * Copia texto al portapapeles con fallback seguro
  */
 export async function copyToClipboard(text: string): Promise<boolean> {
@@ -95,14 +111,21 @@ export async function copyToClipboard(text: string): Promise<boolean> {
     }
     const textArea = document.createElement("textarea");
     textArea.value = text;
+    textArea.setAttribute("readonly", "");
     textArea.style.position = "fixed";
     textArea.style.left = "-999999px";
+    textArea.style.top = "-999999px";
+    textArea.style.opacity = "0";
     document.body.appendChild(textArea);
-    textArea.focus();
-    textArea.select();
-    const successful = document.execCommand("copy");
-    document.body.removeChild(textArea);
-    return successful;
+    try {
+      textArea.focus();
+      textArea.select();
+      return document.execCommand("copy");
+    } finally {
+      if (textArea.parentNode) {
+        document.body.removeChild(textArea);
+      }
+    }
   } catch (err) {
     console.error("Error al copiar al portapapeles:", err);
     return false;
@@ -134,10 +157,13 @@ export function downloadMarkdownFile(story: UserStory) {
 }
 
 /**
- * Descarga la historia en formato CSV para Jira / Excel con BOM UTF-8
+ * Descarga la historia en formato CSV para Jira / Excel con BOM UTF-8 y protección contra Formula Injection
  */
 export function downloadCsvFile(story: UserStory) {
-  const escapeCsv = (str: string) => `"${str.replace(/"/g, '""')}"`;
+  const escapeCsv = (val: string | number | null | undefined) => {
+    const sanitized = sanitizeCsvValue(val);
+    return `"${sanitized.replace(/"/g, '""')}"`;
+  };
 
   const description = `Como ${story.connextra.asA}\nQuiero ${story.connextra.iWant}\nPara ${story.connextra.soThat}`;
   const acceptanceCriteria = story.acceptanceCriteria
@@ -165,7 +191,7 @@ export function downloadCsvFile(story: UserStory) {
     escapeCsv(story.title),
     escapeCsv("Story"),
     escapeCsv(story.priority),
-    escapeCsv(String(story.storyPoints)),
+    escapeCsv(story.storyPoints),
     escapeCsv("Ready for Sprint"),
     escapeCsv(description),
     escapeCsv(acceptanceCriteria),

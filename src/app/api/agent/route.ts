@@ -79,15 +79,128 @@ const SAFETY_SETTINGS = [
 // Caché en memoria del modelo activo para evitar 404 repetitivos
 let cachedFastModel = "gemini-3.8-flash";
 
+// --- Rate Limiting en Memoria (Protección contra DoS / Abuso de Cuota) ---
+const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minuto
+const MAX_REQUESTS_PER_WINDOW = 30; // Máximo 30 peticiones/minuto por IP
+
+interface RateLimitRecord {
+  count: number;
+  resetAt: number;
+}
+
+const rateLimitMap = new Map<string, RateLimitRecord>();
+
+function getClientIp(req: NextRequest): string {
+  const forwarded = req.headers.get("x-forwarded-for");
+  if (forwarded) {
+    const firstIp = forwarded.split(",")[0].trim();
+    if (firstIp) return firstIp;
+  }
+  const realIp = req.headers.get("x-real-ip");
+  if (realIp) return realIp.trim();
+  return "127.0.0.1";
+}
+
+function checkRateLimit(ip: string): { limited: boolean; retryAfter: number } {
+  const now = Date.now();
+  const record = rateLimitMap.get(ip);
+
+  // Limpieza periódica para evitar fugas de memoria
+  if (rateLimitMap.size > 2000) {
+    rateLimitMap.forEach((val, key) => {
+      if (val.resetAt < now) {
+        rateLimitMap.delete(key);
+      }
+    });
+  }
+
+  if (!record || record.resetAt < now) {
+    rateLimitMap.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return { limited: false, retryAfter: 0 };
+  }
+
+  if (record.count >= MAX_REQUESTS_PER_WINDOW) {
+    const retryAfter = Math.ceil((record.resetAt - now) / 1000);
+    return { limited: true, retryAfter: Math.max(1, retryAfter) };
+  }
+
+  record.count += 1;
+  return { limited: false, retryAfter: 0 };
+}
+
+// Sanitiza los mensajes de error para no exponer URLs internas, tokens o stack traces
+function sanitizeErrorMessage(err: any): string {
+  const msg = String(err?.message || err || "");
+  if (/API_KEY_INVALID|invalid.*api.*key|API key not valid/i.test(msg)) {
+    return "La clave de API de Google Gemini no es válida o ha expirado. Por favor verifícala en la configuración superior.";
+  }
+  if (/RESOURCE_EXHAUSTED|quota/i.test(msg)) {
+    return "Se ha superado la cuota de peticiones de Google Gemini. Por favor espera unos minutos o utiliza otra clave API.";
+  }
+  if (/SAFETY|blocked|HarmBlock/i.test(msg)) {
+    return "La solicitud no pudo ser procesada debido a las políticas de seguridad de contenido de IA.";
+  }
+  if (/ECONNRESET|ETIMEDOUT|ENOTFOUND|fetch failed/i.test(msg)) {
+    return "Error de red al conectar con los servidores de Google Gemini. Verifica tu conexión a internet.";
+  }
+  return "No fue posible procesar la consulta con el Agente de IA. Inténtalo nuevamente.";
+}
+
 export async function POST(req: NextRequest) {
+  // 1. Verificación de Rate Limit
+  const clientIp = getClientIp(req);
+  const { limited, retryAfter } = checkRateLimit(clientIp);
+  if (limited) {
+    return NextResponse.json(
+      {
+        error: `Has superado el límite de consultas permitidas (${MAX_REQUESTS_PER_WINDOW}/min). Espera ${retryAfter} segundos.`,
+      },
+      {
+        status: 429,
+        headers: { "Retry-After": String(retryAfter) },
+      }
+    );
+  }
+
   try {
-    const body = await req.json();
+    let body: any;
+    try {
+      body = await req.json();
+    } catch {
+      return NextResponse.json(
+        { error: "Cuerpo de solicitud inválido (debe ser formato JSON válido)." },
+        { status: 400 }
+      );
+    }
+
+    if (!body || typeof body !== "object") {
+      return NextResponse.json(
+        { error: "Payload inválido." },
+        { status: 400 }
+      );
+    }
+
     const { messages, apiKey: clientApiKey, customInstruction } = body;
 
-    const apiKey = clientApiKey || process.env.GEMINI_API_KEY;
-    const activeInstruction = customInstruction && customInstruction.trim().length > 20
-      ? customInstruction.trim()
-      : SYSTEM_INSTRUCTION;
+    // 2. Validación de API Key
+    if (clientApiKey !== undefined && clientApiKey !== null && clientApiKey !== "") {
+      if (typeof clientApiKey !== "string") {
+        return NextResponse.json(
+          { error: "El formato de la API Key es inválido." },
+          { status: 400 }
+        );
+      }
+      const trimmedKey = clientApiKey.trim();
+      // Validar formato seguro: alfanumérico, guión, guión bajo, longitud típica de Google API Key (20 - 150 chars)
+      if (!/^[a-zA-Z0-9_\-]{20,150}$/.test(trimmedKey)) {
+        return NextResponse.json(
+          { error: "La API Key proporcionada no tiene una estructura válida de Google AI Studio." },
+          { status: 400 }
+        );
+      }
+    }
+
+    const apiKey = (clientApiKey ? clientApiKey.trim() : null) || process.env.GEMINI_API_KEY;
 
     if (!apiKey) {
       return NextResponse.json(
@@ -99,6 +212,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // 3. Validación y limitación estricta de mensajes (Prevenir agotamiento de memoria y ReDoS)
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       return NextResponse.json(
         { error: "El historial de mensajes es inválido o está vacío." },
@@ -106,10 +220,59 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    if (messages.length > 30) {
+      return NextResponse.json(
+        { error: "El historial de conversación supera el límite máximo permitido (30 mensajes)." },
+        { status: 400 }
+      );
+    }
+
+    // Validar cada mensaje individual
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      if (!m || typeof m !== "object" || typeof m.content !== "string") {
+        return NextResponse.json(
+          { error: `El mensaje en la posición ${i + 1} no tiene un formato válido.` },
+          { status: 400 }
+        );
+      }
+      if (m.content.length > 8000) {
+        return NextResponse.json(
+          { error: `El mensaje en la posición ${i + 1} excede el límite permitido de 8,000 caracteres.` },
+          { status: 400 }
+        );
+      }
+      if (m.role !== "user" && m.role !== "assistant" && m.role !== "model") {
+        return NextResponse.json(
+          { error: `Rol de mensaje no permitido: ${m.role}` },
+          { status: 400 }
+        );
+      }
+    }
+
+    // 4. Validación de instrucciones de entrenamiento personalizadas
+    let activeInstruction = SYSTEM_INSTRUCTION;
+    if (customInstruction) {
+      if (typeof customInstruction !== "string") {
+        return NextResponse.json(
+          { error: "Las instrucciones de entrenamiento deben ser de tipo texto." },
+          { status: 400 }
+        );
+      }
+      if (customInstruction.length > 10000) {
+        return NextResponse.json(
+          { error: "Las instrucciones de entrenamiento exceden el límite permitido de 10,000 caracteres." },
+          { status: 400 }
+        );
+      }
+      if (customInstruction.trim().length > 20) {
+        activeInstruction = customInstruction.trim();
+      }
+    }
+
     const genAI = new GoogleGenerativeAI(apiKey);
 
     // Format chat history for Gemini SDK
-    // Gemini contents expects { role: 'user' | 'model', parts: [{ text }] }
     const formattedContents = messages.map((m: { role: string; content: string }) => ({
       role: m.role === "assistant" ? "model" : "user",
       parts: [{ text: m.content }],
@@ -126,15 +289,12 @@ export async function POST(req: NextRequest) {
       "gemini-1.5-pro",
     ];
 
-    // Eliminar duplicados manteniendo orden prioritario
     const modelCandidates = Array.from(new Set(preferredOrder));
-
     let lastError: any = null;
     let responseText = "";
 
     for (const modelName of modelCandidates) {
       try {
-        // Intentar primero en modo Ultra-Rápido (thinkingBudget: 0 para evitar pausas de razonamiento de 60s)
         const ultraFastConfig: any = {
           temperature: 0.1,
           responseMimeType: "application/json",
@@ -155,8 +315,8 @@ export async function POST(req: NextRequest) {
             contents: formattedContents,
           });
           responseText = chatResult.response.text();
-        } catch (fastErr: any) {
-          // Si el modelo específico no soporta thinkingConfig, reintentar de inmediato con config estándar
+        } catch {
+          // Si el modelo específico no soporta thinkingBudget, reintentar con config estándar
           const standardConfig = {
             temperature: 0.1,
             responseMimeType: "application/json",
@@ -174,22 +334,20 @@ export async function POST(req: NextRequest) {
         }
 
         if (responseText) {
-          cachedFastModel = modelName; // Guardar en memoria para siguientes consultas instantáneas
-          console.log(`[VELOCIDAD OPTIMIZADA] Respuesta generada exitosamente con: ${modelName}`);
+          cachedFastModel = modelName;
           break;
         }
       } catch (err: any) {
         lastError = err;
-        console.warn(
-          `[FALLBACK] Modelo ${modelName} no disponible (${err?.message || err}). Cambiando de inmediato al siguiente...`
-        );
       }
     }
 
     if (!responseText) {
-      const errorMessage =
-        lastError?.message || "No fue posible generar respuesta con los modelos disponibles.";
-      return NextResponse.json({ error: errorMessage }, { status: 500 });
+      console.error("[SEGURIDAD/API] Error comunicándose con Gemini:", lastError);
+      return NextResponse.json(
+        { error: sanitizeErrorMessage(lastError) },
+        { status: 502 }
+      );
     }
 
     // Parse the JSON response
@@ -203,8 +361,7 @@ export async function POST(req: NextRequest) {
     try {
       const parsedData = JSON.parse(cleanJson);
       return NextResponse.json(parsedData);
-    } catch (parseError) {
-      console.error("Error parseando respuesta JSON de Gemini:", cleanJson);
+    } catch {
       return NextResponse.json(
         {
           type: "clarification",
@@ -215,9 +372,9 @@ export async function POST(req: NextRequest) {
       );
     }
   } catch (error: any) {
-    console.error("Error en /api/agent:", error);
+    console.error("[SEGURIDAD/API] Excepción no controlada en /api/agent:", error);
     return NextResponse.json(
-      { error: error?.message || "Error interno del servidor procesando la solicitud." },
+      { error: sanitizeErrorMessage(error) },
       { status: 500 }
     );
   }
