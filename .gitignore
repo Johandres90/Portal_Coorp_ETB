@@ -1,0 +1,27 @@
+# Dependencias
+/node_modules
+/.pnp
+.pnp.js
+
+# Next.js build y caché
+/.next/
+/out/
+/build
+
+# Archivos de entorno local (sensibles)
+.env*.local
+
+# Logs y depuración
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# IDEs y SO
+.DS_Store
+*.pem
+.vscode/
+.idea/
+
+# Vercel
+.vercel
